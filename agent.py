@@ -102,16 +102,80 @@ def is_stuck_on_click(click_coords):
 def do_scan(window_query):
     scan_note = None
     elements = []
-    hwnd = find_window(window_query)
-    app_name = win32gui.GetWindowText(hwnd) or window_query
+    hwnd = None
+    app_name = window_query
     try:
+        hwnd = find_window(window_query)
+        app_name = win32gui.GetWindowText(hwnd) or window_query
         focus_window(hwnd)
         elements = scan_elements(hwnd)
         if not elements:
             scan_note = "empty scan"
     except Exception as e:
         scan_note = str(e)
-    return elements, scan_note, app_name
+    return elements, scan_note, app_name, hwnd
+
+
+def _center(rect):
+    return (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
+
+
+def find_uia_wrapper_at(hwnd, x, y, elements):
+    """Match UIA wrapper to scan line: same center; prefer name from elements_at."""
+    want_name = None
+    lines = elements_at(elements, x, y)
+    if lines:
+        want_name = target_name(lines[0])
+
+    app = Application(backend="uia").connect(handle=hwnd)
+    root = app.window(handle=hwnd)
+    candidates = []
+    for elem in root.descendants():
+        name = (elem.element_info.name or elem.window_text() or "").strip()
+        if not name:
+            continue
+        try:
+            rect = elem.rectangle()
+        except Exception:
+            continue
+        cx, cy = _center(rect)
+        if cx != x or cy != y:
+            continue
+        candidates.append((elem, name))
+
+    if not candidates:
+        return None
+    if want_name:
+        for elem, name in candidates:
+            if name == want_name:
+                return elem
+        for elem, name in candidates:
+            if want_name in name or name in want_name:
+                return elem
+    return candidates[0][0]
+
+
+def invoke_uia_or_fallback(hwnd, x, y, elements):
+    """
+    Prefer UIA Invoke (no mouse move). Fallback pyautogui.click if invoke unsupported/fails.
+    Returns short status string for logging.
+    """
+    x, y = int(x), int(y)
+    if hwnd is None:
+        pyautogui.click(x, y)
+        return "pyautogui (no window hwnd)"
+
+    wrapper = find_uia_wrapper_at(hwnd, x, y, elements)
+    if wrapper is None:
+        pyautogui.click(x, y)
+        return "pyautogui (no UIA node at xy)"
+
+    try:
+        wrapper.invoke()
+        return "uia invoke"
+    except Exception as e:
+        pyautogui.click(x, y)
+        return f"pyautogui fallback ({type(e).__name__}: {e})"
 
 
 def elements_at(elements, x, y):
@@ -249,63 +313,69 @@ def plan_task(task, app_name):
     return [str(s) for s in steps]
 
 
-while True:
-    task = input("What do you want to do? ")
-    if task.strip().lower() == "stop":
-        break
-
-    window_query = input("Which window? (type part of the window title) ")
-    history = []
-    click_coords = []
-    elements, scan_note, app_name = do_scan(window_query)
-    steps = plan_task(task, app_name)
-    current_step = 1
-    print_plan(app_name, steps, current_step)
-    print_scan(elements, scan_note)
-
+def main():
     while True:
-        messages = build_messages(
-            task, app_name, steps, current_step, history, click_coords, elements, scan_note
-        )
-        result = json.loads(groq_json(messages).choices[0].message.content)
-        log_ai(result, elements, scan_note, current_step)
+        task = input("What do you want to do? ")
+        if task.strip().lower() == "stop":
+            break
 
-        if result.get("action") == "done":
-            if current_step < len(steps):
-                print(
-                    f"--- AI ---\nProblem: done too early — still on step {current_step}/{len(steps)}\n------------"
-                )
-                history.append("fail: done before all steps")
-            else:
-                break
-
-        action = result.get("action")
-        err = validate_action(result)
-        if not err:
-            try:
-                if action == "click":
-                    x, y = int(result["x"]), int(result["y"])
-                    pyautogui.click(x, y)
-                    click_coords.append((x, y))
-                elif action == "type":
-                    pyautogui.typewrite(result["text"], interval=0.05)
-                elif action == "wait":
-                    time.sleep(float(result["seconds"]))
-            except Exception as e:
-                err = str(e)
-
-        if err:
-            print(f"--- AI ---\nProblem: invalid action — {err}\n------------")
-            history.append(f"fail: {err}")
-        else:
-            history.append(action_summary(result))
-            if result.get("step_complete") and current_step < len(steps):
-                current_step += 1
-                print_plan(app_name, steps, current_step)
-            if action == "click" and is_stuck_on_click(click_coords):
-                print("agent stuck")
-                break
-
-        time.sleep(0.3)
-        elements, scan_note, app_name = do_scan(window_query)
+        window_query = input("Which window? (type part of the window title) ")
+        history = []
+        click_coords = []
+        elements, scan_note, app_name, hwnd = do_scan(window_query)
+        steps = plan_task(task, app_name)
+        current_step = 1
+        print_plan(app_name, steps, current_step)
         print_scan(elements, scan_note)
+
+        while True:
+            messages = build_messages(
+                task, app_name, steps, current_step, history, click_coords, elements, scan_note
+            )
+            result = json.loads(groq_json(messages).choices[0].message.content)
+            log_ai(result, elements, scan_note, current_step)
+
+            if result.get("action") == "done":
+                if current_step < len(steps):
+                    print(
+                        f"--- AI ---\nProblem: done too early — still on step {current_step}/{len(steps)}\n------------"
+                    )
+                    history.append("fail: done before all steps")
+                else:
+                    break
+
+            action = result.get("action")
+            err = validate_action(result)
+            if not err:
+                try:
+                    if action == "click":
+                        x, y = int(result["x"]), int(result["y"])
+                        how = invoke_uia_or_fallback(hwnd, x, y, elements)
+                        print(f"  ({how})")
+                        click_coords.append((x, y))
+                    elif action == "type":
+                        pyautogui.typewrite(result["text"], interval=0.05)
+                    elif action == "wait":
+                        time.sleep(float(result["seconds"]))
+                except Exception as e:
+                    err = str(e)
+
+            if err:
+                print(f"--- AI ---\nProblem: invalid action — {err}\n------------")
+                history.append(f"fail: {err}")
+            else:
+                history.append(action_summary(result))
+                if result.get("step_complete") and current_step < len(steps):
+                    current_step += 1
+                    print_plan(app_name, steps, current_step)
+                if action == "click" and is_stuck_on_click(click_coords):
+                    print("agent stuck")
+                    break
+
+            time.sleep(0.3)
+            elements, scan_note, app_name, hwnd = do_scan(window_query)
+            print_scan(elements, scan_note)
+
+
+if __name__ == "__main__":
+    main()
